@@ -2,6 +2,7 @@
 dev = [
     "livekit-agents[openai,silero,turn-detector]~=1.0",
     "livekit-plugins-noise-cancellation~=0.2",
+    "pip>=26.0.1",
     "pydantic>=2.12.5",
     "pyodbc>=5.3.0",
     "python-dotenv>=1.2.1",
