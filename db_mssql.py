@@ -1,78 +1,75 @@
 from __future__ import annotations
 
-import time
-import uuid
-from typing import Any, Dict, Literal, Optional
+import json
+from typing import Optional
 
-from pydantic import BaseModel, Field
+import pyodbc
 
-
-CallType = Literal["emergency", "inquiry", "report"]
-Stage = Literal["need_language", "collecting", "confirming", "created", "ended"]
+from schemas import CallInfo, Metrics
 
 
-class ExtractionConfidence(BaseModel):
-    overall: float = Field(ge=0.0, le=1.0, default=0.0)
-    fields: Dict[str, float] = Field(default_factory=dict)  # e.g. {"location":0.7}
+def connect_mssql(conn_str: str) -> pyodbc.Connection:
+    return pyodbc.connect(conn_str)
 
 
-class CallInfo(BaseModel):
-    call_type: Optional[CallType] = None
-    intent: Optional[str] = None
+def create_incident(
+    conn_str: str,
+    *,
+    call_id: str,
+    language: str,
+    info: CallInfo,
+    transcript_text: str,
+) -> int:
+    """
+    Writes an incident row and returns incident_id.
+    Uses parameterized queries + commit (standard pyodbc pattern). [web:35]
+    """
+    payload = info.model_dump()
+    payload_json = json.dumps(payload, ensure_ascii=False)
 
-    incident_type: Optional[str] = None
-    location: Optional[str] = None
-    caller_name: Optional[str] = None
-
-    optional: Dict[str, str] = Field(default_factory=dict)
-    confidence: ExtractionConfidence = Field(default_factory=ExtractionConfidence)
-
-    confirmed: bool = False
-
-
-class Metrics(BaseModel):
-    call_id: str
-    started_at_unix: float
-    ended_at_unix: Optional[float] = None
-
-    user_turns: int = 0
-    agent_turns: int = 0
-
-    stt_final_count: int = 0
-    stt_interim_count: int = 0
-
-    extraction_updates: int = 0
-    incident_created: bool = False
-    incident_id: Optional[int] = None
+    with connect_mssql(conn_str) as cnxn:
+        cur = cnxn.cursor()
+        cur.execute(
+            """
+            INSERT INTO dbo.Incidents
+                (call_id, language, call_type, incident_type, location, caller_name, confidence_overall, payload_json, transcript_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            call_id,
+            language,
+            info.call_type,
+            info.incident_type,
+            info.location,
+            info.caller_name,
+            float(info.confidence.overall or 0.0),
+            payload_json,
+            transcript_text,
+        )
+        cnxn.commit()  # commit required for insert persistence [web:35]
+        cur.execute("SELECT CAST(SCOPE_IDENTITY() AS INT)")
+        row = cur.fetchone()
+        return int(row[0])
 
 
-class CallState(BaseModel):
-    call_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    language: str = "en"
-    stage: Stage = "need_language"
-
-    info: CallInfo = Field(default_factory=CallInfo)
-    metrics: Metrics = Field(default_factory=lambda: Metrics(call_id=str(uuid.uuid4()), started_at_unix=time.time()))
-
-    def model_post_init(self, __context: Any) -> None:
-        # ensure metrics.call_id matches
-        self.metrics.call_id = self.call_id
-        if not self.metrics.started_at_unix:
-            self.metrics.started_at_unix = time.time()
-
-    def required_missing(self) -> list[str]:
-        """
-        Define required fields for your workflow.
-        - For emergency: incident_type + location + caller_name
-        - For inquiry/report: location optional, name still desired
-        """
-        missing = []
-        if self.info.call_type is None:
-            missing.append("call_type")
-        if self.info.incident_type is None:
-            missing.append("incident_type")
-        if self.info.location is None:
-            missing.append("location")
-        if self.info.caller_name is None:
-            missing.append("caller_name")
-        return missing
+def write_call_metrics(conn_str: str, metrics: Metrics) -> None:
+    with connect_mssql(conn_str) as cnxn:
+        cur = cnxn.cursor()
+        cur.execute(
+            """
+            INSERT INTO dbo.CallMetrics
+                (call_id, started_at_unix, ended_at_unix, user_turns, agent_turns, stt_final_count, stt_interim_count,
+                extraction_updates, incident_created, incident_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            metrics.call_id,
+            float(metrics.started_at_unix),
+            float(metrics.ended_at_unix) if metrics.ended_at_unix is not None else None,
+            int(metrics.user_turns),
+            int(metrics.agent_turns),
+            int(metrics.stt_final_count),
+            int(metrics.stt_interim_count),
+            int(metrics.extraction_updates),
+            1 if metrics.incident_created else 0,
+            int(metrics.incident_id) if metrics.incident_id is not None else None,
+        )
+        cnxn.commit()
